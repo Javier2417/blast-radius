@@ -15,17 +15,68 @@ DATA = Path(os.environ.get("DATA_DIR", "/data" if Path("/data").exists() else "s
 MAPS_FILE = Path(os.environ.get("MAPS_FILE", "/app/maps.json" if Path("/app/maps.json").exists() else "maps.json"))
 MAX_WORKERS = 8
 
-# Fast core test files that exercise all basic syntax and cross-cutting features
+# Fast test files that run in < 0.2s each and cover syntax, cross-cutting features, and utilities
+ULTRA_FAST_SUITE = [
+    "tests/test_diff.py",
+    "tests/test_lineage.py",
+    "tests/test_tokens.py",
+    "tests/test_errors.py",
+    "tests/test_time.py",
+    "tests/test_anonymize.py",
+    "tests/test_dialect_entry_points.py",
+    "tests/test_dialect_imports.py",
+    "tests/dialects/test_pipe_syntax.py",
+    "tests/test_transforms.py",
+    "tests/test_transpile.py",
+]
+
+# Fast core test files that exercise parser, expressions, and dialects
 CORE_FAST_TEST_FILES = [
     "tests/test_parser.py",
     "tests/test_expressions.py",
-    "tests/test_transpile.py",
     "tests/test_serde.py",
-    "tests/test_transforms.py",
     "tests/test_schema.py",
     "tests/test_generator.py",
     "tests/dialects/test_dialect.py",
-]
+] + ULTRA_FAST_SUITE
+
+# Dialect class inheritance tree in sqlglot
+DIALECT_CHILDREN = {
+    "mysql": [
+        "tests/dialects/test_doris.py",
+        "tests/dialects/test_starrocks.py",
+        "tests/dialects/test_singlestore.py",
+    ],
+    "postgres": [
+        "tests/dialects/test_redshift.py",
+        "tests/dialects/test_materialize.py",
+        "tests/dialects/test_risingwave.py",
+    ],
+    "presto": [
+        "tests/dialects/test_trino.py",
+        "tests/dialects/test_athena.py",
+        "tests/dialects/test_dune.py",
+    ],
+    "trino": [
+        "tests/dialects/test_athena.py",
+        "tests/dialects/test_dune.py",
+    ],
+    "hive": [
+        "tests/dialects/test_spark.py",
+        "tests/dialects/test_databricks.py",
+        "tests/dialects/test_athena.py",
+    ],
+    "spark2": [
+        "tests/dialects/test_spark.py",
+        "tests/dialects/test_databricks.py",
+    ],
+    "spark": [
+        "tests/dialects/test_databricks.py",
+    ],
+    "tsql": [
+        "tests/dialects/test_fabric.py",
+    ],
+}
 
 
 def select_tests_for_patch(
@@ -48,9 +99,6 @@ def select_tests_for_patch(
     fixture_to_tests = maps.get("fixture_to_tests", {})
     dialect_to_tests = maps.get("dialect_to_tests", {})
     source_to_tests = maps.get("source_to_tests", {})
-    opt_d_methods = maps.get("opt_dialect_methods", {})
-    parser_d_methods = maps.get("parser_dialect_methods", {})
-    expr_d_methods = maps.get("expr_dialect_methods", {})
 
     selected_files = set()
     selected_ids = set()
@@ -112,14 +160,13 @@ def select_tests_for_patch(
                 if f in dialect_to_tests:
                     for tf in dialect_to_tests[f]:
                         selected_files.add(tf)
-                # Granular methods in optimizer, parser, expressions
-                for met in opt_d_methods.get(stem, []):
-                    selected_ids.add(f"tests/test_optimizer.py::TestOptimizer::{met}")
-                for met in parser_d_methods.get(stem, []):
-                    selected_ids.add(f"tests/test_parser.py::TestParser::{met}")
-                for met in expr_d_methods.get(stem, []):
-                    selected_ids.add(f"tests/test_expressions.py::TestExprs::{met}")
-                # Plus core fast tests
+                # Include child dialects inheriting from this dialect
+                if stem in DIALECT_CHILDREN:
+                    for ctf in DIALECT_CHILDREN[stem]:
+                        selected_files.add(ctf)
+                # Dialects directly impact optimizer sql transformations
+                selected_files.add("tests/test_optimizer.py")
+                # Core fast tests
                 for ctf in CORE_FAST_TEST_FILES:
                     selected_files.add(ctf)
             continue
