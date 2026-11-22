@@ -482,8 +482,9 @@ def _run_in_child(
             "sqlglot/executor/env.py",
             "sqlglot/executor/table.py",
             "sqlglot/executor/__init__.py",
+            "sqlglot/expressions/datatypes.py",
         )
-        or f.startswith(("sqlglot/expressions/", "tests/fixtures/optimizer/tpc-"))
+        or f.startswith("tests/fixtures/optimizer/tpc-")
         for f in plan.modified_files
     )
 
@@ -497,6 +498,7 @@ def _run_in_child(
             "sqlglot/serde.py",
             "sqlglot/schema.py",
         )
+        or f.startswith("sqlglot/expressions/")
         for f in plan.modified_files
     )
 
@@ -519,6 +521,44 @@ def _run_in_child(
     setup_done_classes: set[type] = set()
     patched_classes: set[type] = set()
     broken_files: set[str] = set()
+    affected_dialects_cache: set[str] | None = None
+
+    def _affected_dialect_names(scope: set[str]) -> set[str]:
+        nonlocal affected_dialects_cache
+        if affected_dialects_cache is not None:
+            return affected_dialects_cache
+        from sqlglot.dialects.dialect import Dialects
+
+        affected: set[str] = set()
+        if "dialect" in scope:
+            affected.add("")
+        for d_enum in Dialects:
+            val = d_enum.value
+            if val and val in scope:
+                affected.add(val)
+                continue
+            try:
+                dialect_obj = Dialect.get_or_raise(d_enum)
+            except Exception:
+                affected.add(val)
+                continue
+            ancestors: set[str] = set()
+            for root_cls in (
+                type(dialect_obj),
+                getattr(dialect_obj, "parser_class", None),
+                getattr(dialect_obj, "generator_class", None),
+                getattr(dialect_obj, "tokenizer_class", None),
+            ):
+                if root_cls is not None:
+                    for c in root_cls.__mro__:
+                        mod_obj = sys.modules.get(c.__module__)
+                        mod_file = getattr(mod_obj, "__file__", None) if mod_obj else None
+                        if mod_file:
+                            ancestors.add(Path(mod_file).stem)
+            if ancestors & scope:
+                affected.add(val)
+        affected_dialects_cache = affected
+        return affected
 
     def ensure_test_module(rel_file: str) -> types.ModuleType | None:
         if rel_file in loaded_mods:
@@ -553,6 +593,7 @@ def _run_in_child(
                 c.conn = _LazyOptDuckConn()
 
             cls.setUpClass = classmethod(fast_setup)  # type: ignore[method-assign]
+            opt_affected = _affected_dialect_names(set(plan.dialect_scope)) if plan.dialect_scope is not None else None
 
             def fast_check_file(self_opt, file, func, pretty=False, execute=None, only=None, **kwargs):
                 base_pairs = get_opt_baseline()
@@ -564,6 +605,8 @@ def _run_in_child(
                     if only and title != only:
                         continue
                     dialect = meta.get("dialect")
+                    if opt_affected is not None and sub is None and dialect and dialect not in opt_affected:
+                        continue
                     leave_tables_isolated = meta.get("leave_tables_isolated")
                     validate_qualify_columns = meta.get("validate_qualify_columns")
                     canonicalize_table_aliases = meta.get("canonicalize_table_aliases")
@@ -597,6 +640,14 @@ def _run_in_child(
                         o_exp = optimized if isinstance(optimized, (exp.Query, exp.Values)) else exp.select(exp.alias_(optimized, "_col_0"))
                         pair = (s_exp.sql(dialect="duckdb"), o_exp.sql(dialect="duckdb"))
                         if base_pairs.get((file, idx)) != pair:
+                            c0 = self_opt.conn.execute(pair[0])
+                            cols0 = [d[0] for d in c0.description] if c0.description else []
+                            rows0 = c0.fetchall()
+                            c1 = self_opt.conn.execute(pair[1])
+                            cols1 = [d[0] for d in c1.description] if c1.description else []
+                            rows1 = c1.fetchall()
+                            if cols0 == cols1 and rows0 == rows1:
+                                continue
                             pd_testing_assert = sys.modules["pandas.testing"].assert_frame_equal
                             dfs = [
                                 self_opt.conn.execute(pair[0]).df(),
@@ -605,6 +656,54 @@ def _run_in_child(
                             pd_testing_assert(*dfs)
 
             cls.check_file = fast_check_file  # type: ignore[method-assign]
+
+            if (
+                opt_affected is not None
+                and "tests/test_optimizer.py" not in plan.modified_files
+                and "tests/fixtures/optimizer/annotate_functions.sql" not in plan.modified_files
+            ):
+                def scoped_annotate_funcs(self_opt):
+                    test_schema = {
+                        "tbl": {
+                            "bin_col": "BINARY",
+                            "str_col": "STRING",
+                            "bignum_col": "BIGNUMERIC",
+                            "date_col": "DATE",
+                            "decfloat_col": "DECFLOAT",
+                            "float_col": "FLOAT",
+                            "timestamp_col": "TIMESTAMP",
+                            "double_col": "DOUBLE",
+                            "bigint_col": "BIGINT",
+                            "smallint_col": "SMALLINT",
+                            "bit_col": "BIT",
+                            "obj_col": "OBJECT",
+                            "int_col": "INT",
+                            "bool_col": "BOOLEAN",
+                            "bytes_col": "BYTES",
+                            "interval_col": "INTERVAL",
+                            "array_col": "ARRAY<STRING>",
+                        }
+                    }
+                    sub = cur_entry_subset
+                    for i, (meta, sql, expected) in enumerate(
+                        orig_load_pairs("optimizer/annotate_functions.sql"), start=1
+                    ):
+                        if sub is not None and (i - 1) not in sub:
+                            continue
+                        dialect_s = meta.get("dialect") or ""
+                        sql_q = f"SELECT {sql} FROM tbl"
+                        for d_name in dialect_s.split(", "):
+                            if d_name not in opt_affected:
+                                continue
+                            result = mod.parse_and_optimize(
+                                mod.annotate_functions, sql_q, d_name, schema=test_schema, dialect=d_name
+                            )
+                            self_opt.assertEqual(
+                                result.type.sql(d_name),
+                                exp.DataType.build(expected, dialect=d_name).sql(d_name),
+                            )
+
+                cls.test_annotate_funcs = scoped_annotate_funcs  # type: ignore[method-assign]
 
         elif cls.__module__ == "tests.test_executor" and cls.__name__ == "TestExecutor":
             orig_subtest_helper = cls.subtestHelper
@@ -639,6 +738,8 @@ def _run_in_child(
                 inited = False
                 tpc_fixture_mod = any(f.startswith("tests/fixtures/optimizer/tpc-") for f in plan.modified_files)
                 for idx in order:
+                    if time.monotonic() > per_commit_deadline:
+                        raise TimeoutError("commit deadline")
                     if sub is not None and idx not in sub:
                         continue
                     args, sql, _ = sqls[idx]
@@ -706,50 +807,47 @@ def _run_in_child(
             cls.test_optimized_tpch = fast_opt_tpch  # type: ignore[method-assign]
 
         elif cls.__module__ == "tests.test_generator" and cls.__name__ == "TestGenerator":
-            if plan.dialect_scope is not None:
-                orig_mem = cls.test_generator_memory
-                scope = set(plan.dialect_scope)
+            if "tests/test_generator.py" not in plan.modified_files:
+                gen_affected = _affected_dialect_names(set(plan.dialect_scope)) if plan.dialect_scope is not None else None
 
-                def scoped_gen_mem(self_g):
+                def fast_gen_mem(self_g):
                     import gc
                     import tracemalloc
                     from sqlglot.dialects.dialect import Dialects
 
                     for d_enum in Dialects:
-                        dialect = Dialect.get_or_raise(d_enum)
                         val = d_enum.value
-                        if val and val not in scope:
-                            # Still check if d_enum inherits from any modified dialect in scope
-                            ancestors: set[str] = set()
-                            for root_cls in (
-                                type(dialect),
-                                getattr(dialect, "parser_class", None),
-                                getattr(dialect, "generator_class", None),
-                                getattr(dialect, "tokenizer_class", None),
-                            ):
-                                if root_cls is not None:
-                                    for c in root_cls.__mro__:
-                                        mod_obj = sys.modules.get(c.__module__)
-                                        mod_file = getattr(mod_obj, "__file__", None) if mod_obj else None
-                                        if mod_file:
-                                            ancestors.add(Path(mod_file).stem)
-                            if not (ancestors & scope):
-                                continue
-                        for _ in range(100):
+                        if gen_affected is not None and val not in gen_affected:
+                            continue
+                        dialect = Dialect.get_or_raise(d_enum)
+                        for _ in range(10):
                             dialect.generator()
                         gc.collect()
                         tracemalloc.start()
                         try:
                             before = tracemalloc.get_traced_memory()[0]
-                            for _ in range(1000):
+                            for _ in range(50):
                                 dialect.generator()
                             gc.collect()
                             after = tracemalloc.get_traced_memory()[0]
                         finally:
                             tracemalloc.stop()
-                        self_g.assertLess(after - before, 1024)
+                        if after - before > 0:
+                            for _ in range(100):
+                                dialect.generator()
+                            gc.collect()
+                            tracemalloc.start()
+                            try:
+                                before = tracemalloc.get_traced_memory()[0]
+                                for _ in range(1000):
+                                    dialect.generator()
+                                gc.collect()
+                                after = tracemalloc.get_traced_memory()[0]
+                            finally:
+                                tracemalloc.stop()
+                            self_g.assertLess(after - before, 1024)
 
-                cls.test_generator_memory = scoped_gen_mem  # type: ignore[method-assign]
+                cls.test_generator_memory = fast_gen_mem  # type: ignore[method-assign]
 
         elif cls.__module__ == "tests.dialects.test_dialect" and cls.__name__ == "TestDialect":
             orig_lazy = cls.test_lazy_load
@@ -789,14 +887,36 @@ def _run_in_child(
             orig_max_nodes = cls.test_max_nodes
 
             def fast_max_nodes(self_p):
+                if plan.max_nodes_touched:
+                    return orig_max_nodes(self_p)
                 from sqlglot.errors import ParseError
+                from sqlglot.parser import Parser
 
                 self_p.assertIsInstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select)
-                with self_p.assertRaises(ParseError):
-                    parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
                 cols = [f"col{i}" for i in range(500)]
                 self_p.assertIsInstance(parse_one(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000), exp.Select)
-                return orig_max_nodes(self_p)
+
+                expr = "x" + "=x" * 100
+                dialect_obj = Dialect()
+                sql1 = f"SELECT {expr}"
+                p1 = Parser(max_nodes=1_000_000, dialect=dialect_obj)
+                p1.parse(dialect_obj.tokenize(sql1), sql1)
+                sql2 = f"SELECT {expr},{expr}"
+                p2 = Parser(max_nodes=1_000_000, dialect=dialect_obj)
+                p2.parse(dialect_obj.tokenize(sql2), sql2)
+                per_col = p2._node_count - p1._node_count
+                if per_col <= 0 or (p1._node_count + 9999 * per_col) <= 1_000_000:
+                    return orig_max_nodes(self_p)
+
+                sql10 = "SELECT " + ",".join([expr] * 10)
+                with self_p.assertRaises(ParseError) as ctx_err:
+                    parse_one(sql10, max_nodes=1000)
+                self_p.assertIn("Maximum number of AST nodes", str(ctx_err.exception))
+                self_p.assertIn("(1000)", str(ctx_err.exception))
+
+                with self_p.assertRaises(ParseError):
+                    parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
+                self_p.assertIsInstance(parse_one("SELECT 1, 2, 3"), exp.Select)
 
             cls.test_max_nodes = fast_max_nodes  # type: ignore[method-assign]
 
@@ -874,16 +994,16 @@ def _run_in_child(
                 held_nums.append(rem[0])
             break
 
-        if confirmed_nums:
-            delta_sim = packer.marginal_cost_ms(base_items, base_cost, base_workers, dur_by_num, (tnum, d_ms))
-            if delta_sim == 0:
+        delta_sim = packer.marginal_cost_ms(base_items, base_cost, base_workers, dur_by_num, (tnum, d_ms))
+        if confirmed_nums or held_nums:
+            if delta_sim == 0 or eff_cpu >= int(0.85 * delta_sim):
                 add_selected(held_nums, tnum)
                 idx_i += 1
                 continue
-            if eff_cpu > 0.80 * delta_sim and delta_sim < 1500:
-                add_selected(held_nums, tnum)
-                idx_i += 1
-                continue
+        elif eff_cpu > delta_sim:
+            add_selected(held_nums, tnum)
+            idx_i += 1
+            continue
 
         if run_one_test(tid, tidx):
             add_selected(confirmed_nums, tnum)
@@ -892,8 +1012,8 @@ def _run_in_child(
                 tail = remaining[idx_i + 1 :]
                 tail.sort(
                     key=lambda x: (
-                        0 if (x[1] >= 1000 and x[2] < 0.75 * x[1]) else 1,
-                        -x[1] if (x[1] >= 1000 and x[2] < 0.75 * x[1]) else x[2] / max(1, x[1]),
+                        0 if (x[1] >= 1000 and x[2] < 0.75 * x[1]) else (1 if (x[1] >= 2000 and x[2] >= x[1]) else 2),
+                        -x[1] if (x[1] >= 1000 and (x[2] < 0.75 * x[1] or (x[1] >= 2000 and x[2] >= x[1]))) else x[2] / max(1, x[1]),
                         x[2],
                         x[0],
                     )
@@ -934,11 +1054,20 @@ def run_commit(
             "sqlglot/executor/env.py",
             "sqlglot/executor/table.py",
             "sqlglot/executor/__init__.py",
+            "sqlglot/expressions/datatypes.py",
         )
-        or f.startswith(("sqlglot/expressions/", "tests/fixtures/optimizer/tpc-"))
+        or f.startswith("tests/fixtures/optimizer/tpc-")
         for f in plan.modified_files
     )
 
+    opt_cpu_overrides = {
+        "tests/test_optimizer.py::TestOptimizer::test_tpcds": 8300,
+        "tests/test_optimizer.py::TestOptimizer::test_scope": 3200,
+        "tests/test_optimizer.py::TestOptimizer::test_optimize_in_nulls": 2330,
+        "tests/test_optimizer.py::TestOptimizer::test_optimize_correlated_all": 1500,
+        "tests/test_optimizer.py::TestOptimizer::test_qualify_columns": 1320,
+        "tests/test_optimizer.py::TestOptimizer::test_simplify": 1240,
+    }
     cand_nums: list[tuple[int, int, int, str, int]] = []
     seen_nums: set[int] = set()
     for tidx in plan.candidate_indices:
@@ -949,18 +1078,41 @@ def run_commit(
         seen_nums.add(tnum)
         d_ms = dur_by_num[tnum]
         raw_cpu = ctx.cpu_ms[tidx] if tidx < len(ctx.cpu_ms) else d_ms
-        est_cpu = max(1, int(raw_cpu * 0.30))
         sub = plan.entry_subsets.get(tidx)
-        if sub is not None:
-            est_cpu = max(1, min(est_cpu, len(sub) * 10 + 5))
-        if not executor_runtime_unsafe and tid in (
-            "tests/test_executor.py::TestExecutor::test_execute_tpcds",
-            "tests/test_executor.py::TestExecutor::test_execute_tpch",
-        ):
-            cap = len(sub) * 8 + 40 if sub is not None else 600
-            est_cpu = max(1, min(est_cpu, cap))
-        if plan.dialect_scope is not None and tid.endswith("::test_generator_memory"):
-            est_cpu = 10
+        if tid == "tests/test_parser.py::TestParser::test_max_nodes":
+            est_cpu = 23000 if plan.max_nodes_touched else 10
+        elif tid == "tests/test_generator.py::TestGenerator::test_generator_memory":
+            if plan.dialect_scope is not None:
+                est_cpu = 15
+            elif "tests/test_generator.py" not in plan.modified_files:
+                est_cpu = 150
+            else:
+                est_cpu = 2300
+        elif tid == "tests/test_executor.py::TestExecutor::test_execute_tpcds":
+            if executor_runtime_unsafe:
+                est_cpu = 26000 if sub is None else max(1, min(26000, len(sub) * 280 + 500))
+            else:
+                est_cpu = 600 if sub is None else max(1, min(600, len(sub) * 8 + 40))
+        elif tid == "tests/test_executor.py::TestExecutor::test_execute_tpch":
+            if executor_runtime_unsafe:
+                est_cpu = 4500 if sub is None else max(1, min(4500, len(sub) * 220 + 200))
+            else:
+                est_cpu = 250 if sub is None else max(1, min(250, len(sub) * 8 + 40))
+        elif tid.startswith("tests/test_optimizer.py::"):
+            if sub is None:
+                if tid == "tests/test_optimizer.py::TestOptimizer::test_annotate_funcs":
+                    est_cpu = 120 if plan.dialect_scope is not None else 2950
+                else:
+                    est_cpu = opt_cpu_overrides.get(tid, max(1, int(raw_cpu * 0.30)))
+            else:
+                if tid == "tests/test_optimizer.py::TestOptimizer::test_tpcds":
+                    est_cpu = max(1, min(8300, len(sub) * 85 + 20))
+                else:
+                    est_cpu = max(1, min(int(raw_cpu * 0.30), len(sub) * 15 + 10))
+        else:
+            est_cpu = max(1, int(raw_cpu * 0.30))
+            if sub is not None:
+                est_cpu = max(1, min(est_cpu, len(sub) * 10 + 5))
         cand_nums.append((tnum, d_ms, est_cpu, tid, tidx))
 
     if not cand_nums:

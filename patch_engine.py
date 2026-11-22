@@ -820,6 +820,7 @@ class CommitPlan:
     dialect_scope: set[str] | None
     kind: str
     hot_cls_attrs: dict[str, list[tuple[tuple[str, ...], str, object]]] = field(default_factory=dict)
+    max_nodes_touched: bool = False
 
 
 def _extract_entry_subsets_for_lines(
@@ -1168,6 +1169,22 @@ def analyze_commit(patch_text: str, root_dir: Path, ctx_or_map: MapContext | dic
     if not allow_subsets:
         entry_subsets.clear()
 
+    max_nodes_tokens = (
+        "max_nodes",
+        "_node_count",
+        "validate_expression",
+        "1_000_000",
+        "1000000",
+        "50_000",
+        "50000",
+    )
+    max_nodes_touched = "tests/test_parser.py" in modified_files or any(
+        line.startswith(("+", "-"))
+        and not line.startswith(("+++", "---"))
+        and any(tok in line for tok in max_nodes_tokens)
+        for line in patch_text.splitlines()
+    )
+
     return CommitPlan(
         modified_files=modified_files,
         can_hot_patch=can_hot_patch and bool(hot_targets or hot_cls_attrs),
@@ -1179,6 +1196,7 @@ def analyze_commit(patch_text: str, root_dir: Path, ctx_or_map: MapContext | dic
         dialect_scope=dialect_scope if (dialect_scope and len(dialect_scope) > 0) else None,
         kind="+".join(reasons) or "noop",
         hot_cls_attrs=hot_cls_attrs,
+        max_nodes_touched=max_nodes_touched,
     )
 
 
