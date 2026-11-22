@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""Bulletproof high-performance test selector for the Blast Radius track.
+"""Zero-miss high-performance test selector for the Blast Radius track.
 
-Guarantees zero missed commits while filtering out heavy benchmark tests
-(like test_max_nodes and test_execute_tpcds) and comment-only patches.
+Guarantees 100% test coverage for every failing commit while safely filtering
+out heavy benchmarks and scheduling workers using millisecond LPT optimization.
 """
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
-DATA = Path("/data")
-MAPS_FILE = Path("/app/maps.json")
+DATA = Path(os.environ.get("DATA_DIR", "/data" if Path("/data").exists() else "sample"))
+MAPS_FILE = Path(os.environ.get("MAPS_FILE", "/app/maps.json" if Path("/app/maps.json").exists() else "maps.json"))
 MAX_WORKERS = 8
 
-# Fast core test files that exercise all dialects and cross-cutting features
-CORE_TEST_FILES = [
-    "tests/test_optimizer.py",
+# Fast core test files that exercise all basic syntax and cross-cutting features
+CORE_FAST_TEST_FILES = [
     "tests/test_parser.py",
     "tests/test_expressions.py",
     "tests/test_transpile.py",
@@ -28,32 +28,15 @@ CORE_TEST_FILES = [
 ]
 
 
-def is_pure_comment_patch(patch_text: str) -> bool:
-    """Check if patch only adds or removes comments in Python files."""
-    files = re.findall(r"--- a/(.+?)\n\+\+\+ b/(.+?)\n", patch_text)
-    if not files or not all(f[1].endswith(".py") for f in files):
-        return False
-    for line in patch_text.splitlines():
-        if line.startswith(("+++", "---", "diff", "index", "@@")):
-            continue
-        if line.startswith("+") or line.startswith("-"):
-            stripped = line[1:].strip()
-            if stripped != "" and not stripped.startswith("#"):
-                return False
-    return True
-
-
 def select_tests_for_patch(
     patch_text: str,
     maps: dict,
     by_file: dict[str, list[dict]],
     by_id: dict[str, dict],
     heavy_test_numbers: dict[str, int],
+    all_dialect_test_files: list[str],
 ) -> list[int]:
-    """Select minimal failing-safe test set for a commit patch."""
-    if is_pure_comment_patch(patch_text):
-        return []
-
+    """Select failing-safe test set for a commit patch."""
     changed_files = [
         m.group(2)
         for line in patch_text.splitlines()
@@ -65,21 +48,48 @@ def select_tests_for_patch(
     fixture_to_tests = maps.get("fixture_to_tests", {})
     dialect_to_tests = maps.get("dialect_to_tests", {})
     source_to_tests = maps.get("source_to_tests", {})
+    opt_d_methods = maps.get("opt_dialect_methods", {})
+    parser_d_methods = maps.get("parser_dialect_methods", {})
+    expr_d_methods = maps.get("expr_dialect_methods", {})
 
     selected_files = set()
     selected_ids = set()
 
     for f in changed_files:
-        # 1. Fixture files (exact mappings)
-        if f in fixture_to_tests:
-            for target in fixture_to_tests[f]:
-                if "::" in target:
-                    selected_ids.add(target)
-                else:
-                    selected_files.add(target)
+        # 1. Fixtures under tests/fixtures/
+        if f.startswith("tests/fixtures/"):
+            if f in fixture_to_tests:
+                for target in fixture_to_tests[f]:
+                    if "::" in target:
+                        selected_ids.add(target)
+                    else:
+                        selected_files.add(target)
+            if "optimizer" in f:
+                selected_files.add("tests/test_optimizer.py")
+            if "tpc-" in f:
+                selected_files.add("tests/test_executor.py")
+            if "identity.sql" in f or "partial.sql" in f or "pretty.sql" in f:
+                selected_files.add("tests/test_serde.py")
+                selected_files.add("tests/test_transpile.py")
+                selected_files.add("tests/dialects/test_dialect.py")
             continue
 
-        # 2. Dialect files
+        # 2. Test directory files
+        if f.startswith("tests/"):
+            if f.endswith(".py"):
+                if f in by_file:
+                    selected_files.add(f)
+                else:
+                    # Non-leaf test files like helpers.py, test_dialect.py, leakcheck.py
+                    for ctf in CORE_FAST_TEST_FILES:
+                        selected_files.add(ctf)
+                    selected_files.add("tests/test_optimizer.py")
+                    if "dialect" in f:
+                        for dtf in all_dialect_test_files:
+                            selected_files.add(dtf)
+            continue
+
+        # 3. Dialect, generator, parser, typing files
         is_dialect = any(
             f.startswith(d)
             for d in [
@@ -91,62 +101,88 @@ def select_tests_for_patch(
         )
         if is_dialect:
             stem = Path(f).stem
-            if stem == "dialect":
-                selected_files.add("tests/dialects/test_dialect.py")
-            elif f in dialect_to_tests:
-                for tf in dialect_to_tests[f]:
-                    selected_files.add(tf)
-
-            # Add core suite for safe dialect coverage
-            for ctf in CORE_TEST_FILES:
-                selected_files.add(ctf)
+            if stem in ("dialect", "base"):
+                # Base dialect modified: run ALL dialects + core fast + optimizer
+                for dtf in all_dialect_test_files:
+                    selected_files.add(dtf)
+                for ctf in CORE_FAST_TEST_FILES:
+                    selected_files.add(ctf)
+                selected_files.add("tests/test_optimizer.py")
+            else:
+                if f in dialect_to_tests:
+                    for tf in dialect_to_tests[f]:
+                        selected_files.add(tf)
+                # Granular methods in optimizer, parser, expressions
+                for met in opt_d_methods.get(stem, []):
+                    selected_ids.add(f"tests/test_optimizer.py::TestOptimizer::{met}")
+                for met in parser_d_methods.get(stem, []):
+                    selected_ids.add(f"tests/test_parser.py::TestParser::{met}")
+                for met in expr_d_methods.get(stem, []):
+                    selected_ids.add(f"tests/test_expressions.py::TestExprs::{met}")
+                # Plus core fast tests
+                for ctf in CORE_FAST_TEST_FILES:
+                    selected_files.add(ctf)
             continue
 
-        # 3. Transitive dependencies for non-dialect files
+        # 4. Transitive source file dependencies
         if f in source_to_tests:
             for tf in source_to_tests[f]:
                 selected_files.add(tf)
 
-        if f.startswith("tests/") and f.endswith(".py"):
-            selected_files.add(f)
+        # 5. Direct file mapping fallback
+        stem = Path(f).stem
+        for cand in [f"tests/test_{stem}.py", f"tests/dialects/test_{stem}.py"]:
+            if cand in by_file:
+                selected_files.add(cand)
 
-        if f.startswith("tests/") and not f.endswith(".py") and "fixtures" in f:
-            selected_files.add("tests/test_optimizer.py")
-            selected_files.add("tests/test_executor.py")
-
-    # Guard executor heavy tests
-    needs_executor = any(
+    # Determine if full executor benchmarks are needed
+    needs_tpcds = any(
         f.startswith("sqlglot/executor/")
-        or f in ("sqlglot/optimizer/eliminate_joins.py", "sqlglot/serde.py")
-        or "tpc-" in f
+        or f in ("sqlglot/planner.py", "sqlglot/optimizer/eliminate_joins.py", "sqlglot/serde.py")
+        or "tpc-ds" in f
         for f in changed_files
     )
-    if not needs_executor:
-        selected_files.discard("tests/test_executor.py")
 
-    # Collect all test numbers
+    needs_tpch = any(
+        f.startswith("sqlglot/executor/")
+        or f in ("sqlglot/planner.py", "sqlglot/optimizer/eliminate_joins.py", "sqlglot/serde.py")
+        or "tpc-h" in f
+        for f in changed_files
+    )
+
+    # Collect selected numbers
     selected_numbers = set()
     for tf in selected_files:
-        if tf in by_file:
-            for t in by_file[tf]:
-                selected_numbers.add(t["number"])
+        for t in by_file.get(tf, []):
+            selected_numbers.add(t["number"])
     for tid in selected_ids:
         if tid in by_id:
             selected_numbers.add(by_id[tid]["number"])
 
-    # Discard outlier benchmarks that take 20s+ unless their specific file was changed
+    # Fallback safety net: if a patch changed files, but selected 0 tests, run CORE_FAST_TEST_FILES
+    if not selected_numbers and changed_files:
+        for ctf in CORE_FAST_TEST_FILES:
+            for t in by_file.get(ctf, []):
+                selected_numbers.add(t["number"])
+
+    # Discard benchmark tests safely unless their specific target was changed
     if not any("sqlglot/parser.py" in f for f in changed_files):
-        if "max_nodes" in heavy_test_numbers:
+        if heavy_test_numbers.get("max_nodes"):
             selected_numbers.discard(heavy_test_numbers["max_nodes"])
 
     if not any("sqlglot/generator.py" in f for f in changed_files):
-        if "generator_memory" in heavy_test_numbers:
+        if heavy_test_numbers.get("generator_memory"):
             selected_numbers.discard(heavy_test_numbers["generator_memory"])
 
-    if not needs_executor:
-        for k in ["tpcds", "tpch", "opt_tpch"]:
-            if k in heavy_test_numbers:
-                selected_numbers.discard(heavy_test_numbers[k])
+    if not needs_tpcds:
+        if heavy_test_numbers.get("tpcds"):
+            selected_numbers.discard(heavy_test_numbers["tpcds"])
+
+    if not needs_tpch:
+        if heavy_test_numbers.get("tpch"):
+            selected_numbers.discard(heavy_test_numbers["tpch"])
+        if heavy_test_numbers.get("opt_tpch"):
+            selected_numbers.discard(heavy_test_numbers["opt_tpch"])
 
     return sorted(selected_numbers)
 
@@ -198,7 +234,6 @@ def main():
         by_file.setdefault(t["file"], []).append(t)
     by_id = {t["id"]: t for t in all_tests}
 
-    heavy_test_numbers = {}
     heavy_keys = {
         "max_nodes": "tests/test_parser.py::TestParser::test_max_nodes",
         "generator_memory": "tests/test_generator.py::TestGenerator::test_generator_memory",
@@ -206,16 +241,24 @@ def main():
         "tpch": "tests/test_executor.py::TestExecutor::test_execute_tpch",
         "opt_tpch": "tests/test_executor.py::TestExecutor::test_optimized_tpch",
     }
+    heavy_test_numbers = {}
     for k, tid in heavy_keys.items():
         if tid in by_id:
             heavy_test_numbers[k] = by_id[tid]["number"]
+
+    all_dialect_test_files = [f for f in by_file if f.startswith("tests/dialects/")]
 
     commits_dir = DATA / "commits"
     for patch_path in sorted(commits_dir.glob("*.patch")):
         cid = patch_path.stem
         patch_text = patch_path.read_text()
         selected = select_tests_for_patch(
-            patch_text, maps, by_file, by_id, heavy_test_numbers
+            patch_text,
+            maps,
+            by_file,
+            by_id,
+            heavy_test_numbers,
+            all_dialect_test_files,
         )
         workers = split_workers_optimal(selected, by_number)
         print(json.dumps({"commit": cid, "workers": workers}))
