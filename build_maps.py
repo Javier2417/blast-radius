@@ -137,7 +137,7 @@ def build_dialect_explicit_map(root: Path) -> dict[str, list[str]]:
     """Explicitly map dialect/generator/parser/typing files to their test files."""
     dialect_map: dict[str, list[str]] = {}
     name_to_test: dict[str, list[str]] = {}
-    
+
     test_dir = root / "tests" / "dialects"
     if test_dir.is_dir():
         for tf in test_dir.iterdir():
@@ -146,14 +146,14 @@ def build_dialect_explicit_map(root: Path) -> dict[str, list[str]]:
                 name_to_test.setdefault(dialect_name, []).append(
                     f"tests/dialects/{tf.name}"
                 )
-    
+
     extra_mappings = {
         "spark2": ["tests/dialects/test_spark.py", "tests/dialects/test_databricks.py"],
         "dialect": ["tests/dialects/test_dialect.py"],
         "base": ["tests/dialects/test_dialect.py"],
         "python": [],
     }
-    
+
     for subdir in ["dialects", "generators", "parsers", "typing"]:
         src_dir = root / "sqlglot" / subdir
         if not src_dir.is_dir():
@@ -170,7 +170,7 @@ def build_dialect_explicit_map(root: Path) -> dict[str, list[str]]:
                 tests.update(extra_mappings[name])
             if tests:
                 dialect_map[rel] = sorted(tests)
-    
+
     return dialect_map
 
 
@@ -212,28 +212,68 @@ def build_fixture_map(root: Path) -> dict[str, list[str]]:
     return {k: sorted(v) for k, v in fixture_map.items()}
 
 
-def build_parser_dialect_methods(root: Path) -> dict[str, list[str]]:
-    """Extract which dialects each test method in test_parser.py tests."""
-    parser_methods_by_dialect = defaultdict(list)
-    py_path = root / "tests" / "test_parser.py"
-    if not py_path.exists():
-        return {}
-    
-    # All dialect names
+def build_granular_dialect_methods(root: Path) -> tuple[dict, dict, dict]:
+    """Map dialects to test methods in test_optimizer, test_parser, test_expressions."""
     dialects = [f.stem for f in (root / "sqlglot" / "dialects").glob("*.py") if f.name != "__init__.py"]
-    
-    tree = ast.parse(py_path.read_text())
-    for class_node in tree.body:
-        if isinstance(class_node, ast.ClassDef):
-            for func_node in class_node.body:
-                if isinstance(func_node, ast.FunctionDef) and func_node.name.startswith("test_"):
-                    tid = f"tests/test_parser.py::{class_node.name}::{func_node.name}"
-                    code = ast.unparse(func_node).lower()
-                    for d in dialects:
-                        if f'"{d}"' in code or f"'{d}'" in code or f"{d}." in code:
-                            parser_methods_by_dialect[d].append(tid)
-                            
-    return {k: sorted(v) for k, v in parser_methods_by_dialect.items()}
+
+    # 1. Optimizer methods
+    opt_dialect_methods = defaultdict(list)
+    opt_tree = ast.parse((root / "tests" / "test_optimizer.py").read_text())
+    for node in ast.walk(opt_tree):
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+            code = ast.unparse(node).lower()
+            for d in dialects:
+                if f'"{d}"' in code or f"'{d}'" in code or f"={d}" in code or f"({d}" in code:
+                    opt_dialect_methods[d].append(node.name)
+
+    # Fixture dialect annotations in optimizer .sql
+    fixture_dialects = defaultdict(set)
+    for f in (root / "tests" / "fixtures" / "optimizer").glob("*.sql"):
+        content = f.read_text().lower()
+        for d in dialects:
+            if f"dialect: {d}" in content or f"read: {d}" in content or f"write: {d}" in content or f"{d}," in content or f", {d}" in content:
+                fixture_dialects[f.stem].add(d)
+
+    for node in ast.walk(opt_tree):
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call):
+                    func_name = ""
+                    if isinstance(sub.func, ast.Attribute): func_name = sub.func.attr
+                    elif isinstance(sub.func, ast.Name): func_name = sub.func.id
+                    if func_name in ("check_file", "load_sql_fixtures", "load_sql_fixture_pairs"):
+                        for arg in sub.args:
+                            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                                fix_stem = Path(arg.value).stem
+                                for d in fixture_dialects.get(fix_stem, set()):
+                                    if node.name not in opt_dialect_methods[d]:
+                                        opt_dialect_methods[d].append(node.name)
+
+    # 2. Parser methods
+    parser_dialect_methods = defaultdict(list)
+    ptree = ast.parse((root / "tests" / "test_parser.py").read_text())
+    for node in ast.walk(ptree):
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+            code = ast.unparse(node).lower()
+            for d in dialects:
+                if f'"{d}"' in code or f"'{d}'" in code or f"={d}" in code:
+                    parser_dialect_methods[d].append(node.name)
+
+    # 3. Expressions methods
+    expr_dialect_methods = defaultdict(list)
+    etree = ast.parse((root / "tests" / "test_expressions.py").read_text())
+    for node in ast.walk(etree):
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+            code = ast.unparse(node).lower()
+            for d in dialects:
+                if f'\"{d}\"' in code or f"'{d}'" in code or f"={d}" in code:
+                    expr_dialect_methods[d].append(node.name)
+
+    return (
+        {k: sorted(v) for k, v in opt_dialect_methods.items()},
+        {k: sorted(v) for k, v in parser_dialect_methods.items()},
+        {k: sorted(v) for k, v in expr_dialect_methods.items()},
+    )
 
 
 def main():
@@ -251,13 +291,15 @@ def main():
     src_to_tests = build_source_to_test_map(modules, test_imports, closure)
     fixture_map = build_fixture_map(root)
     dialect_map = build_dialect_explicit_map(root)
-    parser_dialect_methods = build_parser_dialect_methods(root)
+    opt_d_methods, parser_d_methods, expr_d_methods = build_granular_dialect_methods(root)
 
     maps = {
         "source_to_tests": src_to_tests,
         "fixture_to_tests": fixture_map,
         "dialect_to_tests": dialect_map,
-        "parser_dialect_methods": parser_dialect_methods,
+        "opt_dialect_methods": opt_d_methods,
+        "parser_dialect_methods": parser_d_methods,
+        "expr_dialect_methods": expr_d_methods,
     }
 
     out = Path(os.environ.get("MAPS_OUT", "/app/maps.json"))

@@ -52,12 +52,12 @@ def select_tests_for_patch(
     fixture_to_tests = maps["fixture_to_tests"]
     dialect_to_tests = maps["dialect_to_tests"]
     source_to_tests = maps["source_to_tests"]
+    opt_dialect_methods = maps.get("opt_dialect_methods", {})
     parser_dialect_methods = maps.get("parser_dialect_methods", {})
+    expr_dialect_methods = maps.get("expr_dialect_methods", {})
 
     selected_files = set()
     selected_ids = set()
-    touches_dialect = False
-    dialects_touched = set()
 
     for f in changed_files:
         if f in fixture_to_tests:
@@ -68,14 +68,43 @@ def select_tests_for_patch(
                     selected_files.add(target)
             continue
 
-        for subdir in ["sqlglot/dialects/", "sqlglot/generators/", "sqlglot/parsers/", "sqlglot/typing/"]:
-            if f.startswith(subdir):
-                touches_dialect = True
-                dialects_touched.add(Path(f).stem)
-
-        if f in dialect_to_tests:
-            for tf in dialect_to_tests[f]:
-                selected_files.add(tf)
+        is_dialect = any(
+            f.startswith(d)
+            for d in [
+                "sqlglot/dialects/",
+                "sqlglot/generators/",
+                "sqlglot/parsers/",
+                "sqlglot/typing/",
+            ]
+        )
+        if is_dialect:
+            stem = Path(f).stem
+            if stem == "dialect":
+                selected_files.add("tests/dialects/test_dialect.py")
+            else:
+                if f in dialect_to_tests:
+                    for tf in dialect_to_tests[f]:
+                        selected_files.add(tf)
+                for m in opt_dialect_methods.get(stem, []):
+                    tid = f"tests/test_optimizer.py::TestOptimizer::{m}"
+                    if tid in by_id:
+                        selected_ids.add(tid)
+                for m in parser_dialect_methods.get(stem, []):
+                    tid = f"tests/test_parser.py::TestParser::{m}"
+                    if tid in by_id:
+                        selected_ids.add(tid)
+                for m in expr_dialect_methods.get(stem, []):
+                    tid = f"tests/test_expressions.py::TestExprs::{m}"
+                    if tid in by_id:
+                        selected_ids.add(tid)
+                for ltf in [
+                    "tests/test_transpile.py",
+                    "tests/test_serde.py",
+                    "tests/test_transforms.py",
+                    "tests/test_schema.py",
+                ]:
+                    selected_files.add(ltf)
+            continue
 
         if f in source_to_tests:
             for tf in source_to_tests[f]:
@@ -88,28 +117,15 @@ def select_tests_for_patch(
             selected_files.add("tests/test_optimizer.py")
             selected_files.add("tests/test_executor.py")
 
-    if touches_dialect:
-        only_dialect = all(
-            any(f.startswith(d) for d in ["sqlglot/dialects/", "sqlglot/generators/", "sqlglot/parsers/", "sqlglot/typing/"])
-            for f in changed_files
-        )
-        if only_dialect and not any(d in dialects_touched for d in ["duckdb", "sqlite"]):
-            selected_files.discard("tests/test_executor.py")
-            selected_files.discard("tests/test_parser.py")
-            for d in dialects_touched:
-                for tid in parser_dialect_methods.get(d, []):
-                    if tid in by_id:
-                        selected_ids.add(tid)
-
-        for ltf in [
-            "tests/test_expressions.py",
-            "tests/test_transpile.py",
-            "tests/test_serde.py",
-            "tests/test_transforms.py",
-            "tests/test_schema.py",
-            "tests/test_optimizer.py",
-        ]:
-            selected_files.add(ltf)
+    # Guard heavy test_executor.py: only run if executor, serde, or join logic changed
+    needs_executor = any(
+        f.startswith("sqlglot/executor/")
+        or f in ("sqlglot/optimizer/eliminate_joins.py", "sqlglot/serde.py")
+        or "tpc-" in f
+        for f in changed_files
+    )
+    if not needs_executor:
+        selected_files.discard("tests/test_executor.py")
 
     selected_numbers = set()
     for tf in selected_files:
