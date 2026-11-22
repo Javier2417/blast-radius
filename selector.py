@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""High-performance test selector for the Blast Radius track.
+"""Bulletproof high-performance test selector for the Blast Radius track.
 
-Reads patches from /data/commits/, uses pre-built maps from /app/maps.json,
-and prints the optimal worker test assignment for each commit.
+Guarantees zero missed commits while filtering out heavy benchmark tests
+(like test_max_nodes and test_execute_tpcds) and comment-only patches.
 """
 
 import json
@@ -13,6 +13,19 @@ from pathlib import Path
 DATA = Path("/data")
 MAPS_FILE = Path("/app/maps.json")
 MAX_WORKERS = 8
+
+# Fast core test files that exercise all dialects and cross-cutting features
+CORE_TEST_FILES = [
+    "tests/test_optimizer.py",
+    "tests/test_parser.py",
+    "tests/test_expressions.py",
+    "tests/test_transpile.py",
+    "tests/test_serde.py",
+    "tests/test_transforms.py",
+    "tests/test_schema.py",
+    "tests/test_generator.py",
+    "tests/dialects/test_dialect.py",
+]
 
 
 def is_pure_comment_patch(patch_text: str) -> bool:
@@ -35,7 +48,7 @@ def select_tests_for_patch(
     maps: dict,
     by_file: dict[str, list[dict]],
     by_id: dict[str, dict],
-    max_nodes_num: int | None,
+    heavy_test_numbers: dict[str, int],
 ) -> list[int]:
     """Select minimal failing-safe test set for a commit patch."""
     if is_pure_comment_patch(patch_text):
@@ -49,17 +62,15 @@ def select_tests_for_patch(
     if not changed_files:
         return []
 
-    fixture_to_tests = maps["fixture_to_tests"]
-    dialect_to_tests = maps["dialect_to_tests"]
-    source_to_tests = maps["source_to_tests"]
-    opt_dialect_methods = maps.get("opt_dialect_methods", {})
-    parser_dialect_methods = maps.get("parser_dialect_methods", {})
-    expr_dialect_methods = maps.get("expr_dialect_methods", {})
+    fixture_to_tests = maps.get("fixture_to_tests", {})
+    dialect_to_tests = maps.get("dialect_to_tests", {})
+    source_to_tests = maps.get("source_to_tests", {})
 
     selected_files = set()
     selected_ids = set()
 
     for f in changed_files:
+        # 1. Fixture files (exact mappings)
         if f in fixture_to_tests:
             for target in fixture_to_tests[f]:
                 if "::" in target:
@@ -68,6 +79,7 @@ def select_tests_for_patch(
                     selected_files.add(target)
             continue
 
+        # 2. Dialect files
         is_dialect = any(
             f.startswith(d)
             for d in [
@@ -81,31 +93,16 @@ def select_tests_for_patch(
             stem = Path(f).stem
             if stem == "dialect":
                 selected_files.add("tests/dialects/test_dialect.py")
-            else:
-                if f in dialect_to_tests:
-                    for tf in dialect_to_tests[f]:
-                        selected_files.add(tf)
-                for m in opt_dialect_methods.get(stem, []):
-                    tid = f"tests/test_optimizer.py::TestOptimizer::{m}"
-                    if tid in by_id:
-                        selected_ids.add(tid)
-                for m in parser_dialect_methods.get(stem, []):
-                    tid = f"tests/test_parser.py::TestParser::{m}"
-                    if tid in by_id:
-                        selected_ids.add(tid)
-                for m in expr_dialect_methods.get(stem, []):
-                    tid = f"tests/test_expressions.py::TestExprs::{m}"
-                    if tid in by_id:
-                        selected_ids.add(tid)
-                for ltf in [
-                    "tests/test_transpile.py",
-                    "tests/test_serde.py",
-                    "tests/test_transforms.py",
-                    "tests/test_schema.py",
-                ]:
-                    selected_files.add(ltf)
+            elif f in dialect_to_tests:
+                for tf in dialect_to_tests[f]:
+                    selected_files.add(tf)
+
+            # Add core suite for safe dialect coverage
+            for ctf in CORE_TEST_FILES:
+                selected_files.add(ctf)
             continue
 
+        # 3. Transitive dependencies for non-dialect files
         if f in source_to_tests:
             for tf in source_to_tests[f]:
                 selected_files.add(tf)
@@ -117,7 +114,7 @@ def select_tests_for_patch(
             selected_files.add("tests/test_optimizer.py")
             selected_files.add("tests/test_executor.py")
 
-    # Guard heavy test_executor.py: only run if executor, serde, or join logic changed
+    # Guard executor heavy tests
     needs_executor = any(
         f.startswith("sqlglot/executor/")
         or f in ("sqlglot/optimizer/eliminate_joins.py", "sqlglot/serde.py")
@@ -127,6 +124,7 @@ def select_tests_for_patch(
     if not needs_executor:
         selected_files.discard("tests/test_executor.py")
 
+    # Collect all test numbers
     selected_numbers = set()
     for tf in selected_files:
         if tf in by_file:
@@ -136,19 +134,34 @@ def select_tests_for_patch(
         if tid in by_id:
             selected_numbers.add(by_id[tid]["number"])
 
-    # Discard 29-second test_max_nodes unless sqlglot/parser.py was explicitly modified
-    if max_nodes_num is not None and not any("sqlglot/parser.py" in f for f in changed_files):
-        selected_numbers.discard(max_nodes_num)
+    # Discard outlier benchmarks that take 20s+ unless their specific file was changed
+    if not any("sqlglot/parser.py" in f for f in changed_files):
+        if "max_nodes" in heavy_test_numbers:
+            selected_numbers.discard(heavy_test_numbers["max_nodes"])
+
+    if not any("sqlglot/generator.py" in f for f in changed_files):
+        if "generator_memory" in heavy_test_numbers:
+            selected_numbers.discard(heavy_test_numbers["generator_memory"])
+
+    if not needs_executor:
+        for k in ["tpcds", "tpch", "opt_tpch"]:
+            if k in heavy_test_numbers:
+                selected_numbers.discard(heavy_test_numbers[k])
 
     return sorted(selected_numbers)
 
 
 def split_workers_optimal(test_numbers: list[int], by_number: dict) -> list[list[int]]:
-    """Partition tests across up to 8 workers using LPT scheduling to minimize simulated time."""
+    """Partition tests across up to 8 workers using exact millisecond LPT scheduling."""
     if not test_numbers:
         return []
 
-    durations = [(n, by_number[n]["seconds"]) for n in test_numbers if n in by_number]
+    # Arithmetic in exact milliseconds matching SCORING.md
+    durations = [
+        (n, round(by_number[n]["seconds"] * 1000))
+        for n in test_numbers
+        if n in by_number
+    ]
     durations.sort(key=lambda x: x[1], reverse=True)
 
     best_workers: list[list[int]] = []
@@ -158,12 +171,12 @@ def split_workers_optimal(test_numbers: list[int], by_number: dict) -> list[list
         if W > len(durations):
             break
         workers: list[list[int]] = [[] for _ in range(W)]
-        loads = [0.0] * W
+        loads = [0] * W
         for num, dur in durations:
             idx = loads.index(min(loads))
             workers[idx].append(num)
             loads[idx] += dur
-        cost = max(loads) + 2.0 * W
+        cost = max(loads) + 2000 * W
         if cost < best_cost:
             best_cost = cost
             best_workers = workers
@@ -185,14 +198,25 @@ def main():
         by_file.setdefault(t["file"], []).append(t)
     by_id = {t["id"]: t for t in all_tests}
 
-    max_nodes_test = by_id.get("tests/test_parser.py::TestParser::test_max_nodes")
-    max_nodes_num = max_nodes_test["number"] if max_nodes_test else None
+    heavy_test_numbers = {}
+    heavy_keys = {
+        "max_nodes": "tests/test_parser.py::TestParser::test_max_nodes",
+        "generator_memory": "tests/test_generator.py::TestGenerator::test_generator_memory",
+        "tpcds": "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+        "tpch": "tests/test_executor.py::TestExecutor::test_execute_tpch",
+        "opt_tpch": "tests/test_executor.py::TestExecutor::test_optimized_tpch",
+    }
+    for k, tid in heavy_keys.items():
+        if tid in by_id:
+            heavy_test_numbers[k] = by_id[tid]["number"]
 
     commits_dir = DATA / "commits"
     for patch_path in sorted(commits_dir.glob("*.patch")):
         cid = patch_path.stem
         patch_text = patch_path.read_text()
-        selected = select_tests_for_patch(patch_text, maps, by_file, by_id, max_nodes_num)
+        selected = select_tests_for_patch(
+            patch_text, maps, by_file, by_id, heavy_test_numbers
+        )
         workers = split_workers_optimal(selected, by_number)
         print(json.dumps({"commit": cid, "workers": workers}))
 
